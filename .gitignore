@@ -1,0 +1,30 @@
+# 데이터 파일
+*.csv
+*.json
+
+# 로그 파일
+*.log
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 이미지 파일 (선택사항)
+*.png
+*.jpg
