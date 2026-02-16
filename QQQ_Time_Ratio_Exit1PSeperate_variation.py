@@ -263,11 +263,19 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
         short_total_size = sum(p['size'] for p in short_positions) if short_positions else 0
         long_total_size = sum(p['size'] for p in long_positions) if long_positions else 0
 
-        # 2. 분할 매도 조건 (각 투입 건별 1% 수익 시)
+        # 2. 분할 매도 조건 (각 투입 건별 최소 1% 수익 시)
         exit_short_parts = []
         if enable_short:  # Only process short exits when enabled
             for p in short_positions:
-                if p.get('active', True) and current_price <= p['target_price']:
+                if p.get('active', True):
+                    # SHORT 최소 이익 라인: 평단 대비 +1% 수익 구간 (가격은 평단의 99%)
+                    min_profit_target = short_avg_price_at_exit * (1 - 0.01) if short_avg_price_at_exit > 0 else p['target_price']
+                    # 손실/저수익 구간에 설정된 기존 target_price가 있다면, 최소 1% 이익 라인으로 올려서 사용
+                    effective_target = min(p['target_price'], min_profit_target)
+                    if current_price > effective_target:
+                        continue
+                    # 이후 로직에서는 항상 최소 1% 이상 이익이 되는 구간에서만 청산
+                    p['target_price'] = effective_target
                     received = p['size'] * current_price * (1 + LEVERAGE * (p['price'] - current_price) / p['price'])
                     # 평단 기준 손익 계산 (트리거된 target_price 기준으로, exit 시점의 평단 사용)
                     actual_profit = p['size'] * (short_avg_price_at_exit - p['target_price']) * LEVERAGE
@@ -283,7 +291,15 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
 
         exit_long_parts = []
         for p in long_positions:
-            if p.get('active', True) and current_price >= p['target_price']:
+            if p.get('active', True):
+                # LONG 최소 이익 라인: 평단 대비 +1% 수익 구간 (가격은 평단의 101%)
+                min_profit_target = long_avg_price_at_exit * (1 + 0.01) if long_avg_price_at_exit > 0 else p['target_price']
+                # 손실/저수익 구간에 설정된 기존 target_price가 있다면, 최소 1% 이익 라인으로 올려서 사용
+                effective_target = max(p['target_price'], min_profit_target)
+                if current_price < effective_target:
+                    continue
+                # 이후 로직에서는 항상 최소 1% 이상 이익이 되는 구간에서만 청산
+                p['target_price'] = effective_target
                 received = p['size'] * current_price * (1 + LEVERAGE * (current_price - p['price']) / p['price'])
                 # 평단 기준 손익 계산 (트리거된 target_price 기준으로, exit 시점의 평단 사용)
                 actual_profit = p['size'] * (p['target_price'] - long_avg_price_at_exit) * LEVERAGE
@@ -319,19 +335,28 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
                 # Sort positions by their original entry price to apply new targets systematically
                 active_long_positions.sort(key=lambda p: p['price'])
                 
-                # Rebalance strategy: Set target prices based on current profit + incremental steps
-                # If current profit is 1.5%, then:
-                # 1st position: 1.5% + 0.1% = 1.6%
-                # 2nd position: 1.5% + 0.6% = 2.1% (1.5% + 0.1% * 6)
-                # 3rd position: 1.5% + 1.1% = 2.6% (1.5% + 0.1% * 11)
-                # Pattern: current_profit_percent + rebalance_increment * (1 + 5*i)
+                # Rebalance strategy:
+                # - profit < 1%  : 1.0% 에서 시작 (손실도 확정하지 않고 1% 이익까지 기다림)
+                # - profit ≥ 1% : 현재 profit + rebalance_increment 에서 시작
+                #   (예: rebalance_increment=0.5% → 현재+0.5%부터 0.5% 간격)
+                # 간격(spacing)은 rebalance_increment (0.1% ~ 0.5%) 사용
+                if current_profit_percent < 0.01:
+                    # Loss or Low profit: Always start from 1% baseline (손실 확정 안함)
+                    start_profit_pct = 0.01
+                else:
+                    # Profit at or above 1%: Start from current + rebalance_increment
+                    start_profit_pct = current_profit_percent + rebalance_increment
+                
+                # spacing between staggered targets: 0.1% ~ 0.5%
+                increment = rebalance_increment
 
                 if verbose:
-                    print(f"  [REBALANCE LONG] time={timestamp}, current_price={current_price:.2f}, long_avg={long_avg_price_before:.2f}, current_profit%={current_profit_percent*100:.2f}%, count={len(active_long_positions)}")
+                    print(f"  [REBALANCE LONG] time={timestamp}, current_price={current_price:.2f}, long_avg={long_avg_price_before:.2f}, current_profit%={current_profit_percent*100:.2f}%, start_pct={start_profit_pct*100:.2f}%, spacing={increment*100:.1f}%, count={len(active_long_positions)}")
 
                 # Assign new target prices to remaining long positions
+                # spacing = rebalance_increment (0.1% ~ 0.5%)
                 for i, p in enumerate(active_long_positions):
-                    new_target_profit_pct = current_profit_percent + rebalance_increment * (1 + 5 * i)
+                    new_target_profit_pct = start_profit_pct + i * increment
                     p['target_price'] = long_avg_price_before * (1 + new_target_profit_pct)
                     if verbose:
                         print(f"    [{i}] target_profit%={new_target_profit_pct*100:.2f}%, target_price={p['target_price']:.2f}")
@@ -352,15 +377,28 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
                     # Sort positions by their original entry price
                     active_short_positions.sort(key=lambda p: p['price'], reverse=True) # Higher price first
                     
-                    # Rebalance strategy: Set target prices based on current profit + incremental steps
-                    # Pattern: current_profit_percent - rebalance_increment * (1 + 5*i) (inverted for short)
+                    # Rebalance strategy:
+                    # - profit < 1%  : 1.0% 에서 시작 (손실도 확정하지 않고 1% 이익까지 기다림)
+                    # - profit ≥ 1% : 현재 profit + rebalance_increment 에서 시작
+                    #   (예: rebalance_increment=0.5% → 현재+0.5%부터 0.5% 간격)
+                    # 간격(spacing)은 rebalance_increment (0.1% ~ 0.5%) 사용
+                    if current_profit_percent < 0.01:
+                        # Loss or Low profit: Always start from 1% baseline (손실 확정 안함)
+                        start_profit_pct = 0.01
+                    else:
+                        # Profit at or above 1%: Start from current + rebalance_increment
+                        start_profit_pct = current_profit_percent + rebalance_increment
+                    
+                    # spacing between staggered targets: 0.1% ~ 0.5%
+                    increment = rebalance_increment
 
                     if verbose:
-                        print(f"  [REBALANCE SHORT] time={timestamp}, current_price={current_price:.2f}, short_avg={short_rebalance_avg:.2f}, current_profit%={current_profit_percent*100:.2f}%, count={len(active_short_positions)}")
+                        print(f"  [REBALANCE SHORT] time={timestamp}, current_price={current_price:.2f}, short_avg={short_rebalance_avg:.2f}, current_profit%={current_profit_percent*100:.2f}%, start_pct={start_profit_pct*100:.2f}%, spacing={increment*100:.1f}%, count={len(active_short_positions)}")
 
                     # Assign new target prices to remaining short positions
+                    # spacing = rebalance_increment (0.1% ~ 0.5%)
                     for i, p in enumerate(active_short_positions):
-                        new_target_profit_pct = current_profit_percent + rebalance_increment * (1 + 5 * i)
+                        new_target_profit_pct = start_profit_pct + i * increment
                         p['target_price'] = short_rebalance_avg * (1 - new_target_profit_pct)
                         if verbose:
                             print(f"    [{i}] target_profit%={new_target_profit_pct*100:.2f}%, target_price={p['target_price']:.2f}")
@@ -388,11 +426,15 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
         short_val = sum(p['size'] * current_price * (1 + LEVERAGE * (p['price'] - current_price) / p['price']) for p in active_short_calc) if active_short_calc else 0
         total_balance_here = free_balance + long_val + short_val
 
-        # 현재 보유 포지션의 exit 준비 가격 표시 (active만 표시)
+        # 현재 보유 포지션의 exit 준비 가격 표시 (active만 표시, target_price 기준 정렬)
         exit_ready_list = []
-        for p in active_long_calc:
+        # LONG 포지션 (낮은 가격부터 높은 가격 순서)
+        sorted_long = sorted(active_long_calc, key=lambda p: p['target_price'])
+        for p in sorted_long:
             exit_ready_list.append(f"L:{p['target_price']:.2f}({p['size']:.4f})")
-        for p in active_short_calc:
+        # SHORT 포지션 (높은 가격부터 낮은 가격 순서)
+        sorted_short = sorted(active_short_calc, key=lambda p: p['target_price'], reverse=True)
+        for p in sorted_short:
             exit_ready_list.append(f"S:{p['target_price']:.2f}({p['size']:.4f})")
         current_ready_to_exit = ", ".join(exit_ready_list) if exit_ready_list else ""
         
@@ -499,24 +541,41 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
             short_avg_price = sum(p['price'] * p['size'] for p in active_short_final) / sum(p['size'] for p in active_short_final) if active_short_final else 0
             long_avg_price = sum(p['price'] * p['size'] for p in active_long_final) / sum(p['size'] for p in active_long_final) if active_long_final else 0
             
-            # Entry 직후 각 포지션의 target_price를 재조정 간격으로 설정 (1%, 1+ri%, 1+2*ri%, ...)
-            # 각 포지션이 다른 레벨에서 차례로 exit되도록
-            for i, p in enumerate(active_long_final):
-                target_profit_pct = 0.01 + i * rebalance_increment
-                p['target_price'] = round(long_avg_price * (1 + target_profit_pct), 4)
-            for i, p in enumerate(active_short_final):
-                target_profit_pct = 0.01 + i * rebalance_increment
-                p['target_price'] = round(short_avg_price * (1 - target_profit_pct), 2)
-            
             # Result에 새로운 평단 반영
             result['short_avg'] = round(short_avg_price, 2)
             result['long_avg'] = round(long_avg_price, 2)
             
+            # 현재 profit 계산
             short_profit_after_entry = round((short_avg_price - current_price) / current_price * 100, 2) if current_price != 0 else 0
             long_profit_after_entry = round((current_price - long_avg_price) / long_avg_price * 100, 2) if long_avg_price != 0 else 0
             
             result['short_profit'] = short_profit_after_entry
             result['long_profit'] = long_profit_after_entry
+            
+            # Entry 직후 각 포지션의 target_price를 현재 profit에 따라 설정
+            # profit < 1% → 1.0%부터 0.5% 간격 (1.0%, 1.5%, 2.0%, 2.5%, ...)
+            # profit >= 1% → 현재profit + 0.1%부터 0.5% 간격
+            entry_increment = 0.005  # 0.5% (0.005)
+            
+            # LONG 포지션 target 설정
+            if long_profit_after_entry < 1.0:
+                long_entry_start = 0.01  # 1.0%
+            else:
+                long_entry_start = long_profit_after_entry / 100 + 0.001  # 현재 profit + 0.1%
+            
+            for i, p in enumerate(active_long_final):
+                target_profit_pct = long_entry_start + i * entry_increment
+                p['target_price'] = round(p['price'] * (1 + target_profit_pct), 4)
+            
+            # SHORT 포지션 target 설정
+            if short_profit_after_entry < 1.0:
+                short_entry_start = 0.01  # 1.0%
+            else:
+                short_entry_start = short_profit_after_entry / 100 + 0.001  # 현재 profit + 0.1%
+            
+            for i, p in enumerate(active_short_final):
+                target_profit_pct = short_entry_start + i * entry_increment
+                p['target_price'] = round(p['price'] * (1 - target_profit_pct), 2)
         
         short_total_size = sum(p['size'] for p in active_short_final) if active_short_final else 0
         long_total_size = sum(p['size'] for p in active_long_final) if active_long_final else 0
@@ -646,7 +705,7 @@ if __name__ == "__main__":
             print("="*80)
             best_short_counter, best_long_counter = 12, 12
             best_short_denom, best_long_denom = 100, 100
-            best_rebalance_increment = 0.001 
+            best_rebalance_increment = 0.005 
         else:
             # 1~20 x 1~20 시간, 비율 1/50~1/110 (10단위 7개) 각각 → 20*20*7*7 = 19600 케이스, total_rate>100 드랍
             # CPU 멀티프로세싱으로 병렬 실행
@@ -657,11 +716,12 @@ if __name__ == "__main__":
             print(f"Parallel: ProcessPoolExecutor max_workers={n_workers}")
             print("="*80)
             
-            short_counter_range = list(range(1, 22, 3))   # 1~20
-            long_counter_range = list(range(1, 22, 3))    # 1~20
-            ratio_denominators = [100]
-            #ratio_denominators = list(range(100, 100, 10))  # 100,110,120,130,140,150 → 6개
-            rebalance_increments = [0.001, 0.002, 0.003, 0.004, 0.005]  # 0.1% ~ 0.5% 재조정 간격
+            short_counter_range = list(range(1, 2, 1))   # 1~20
+            long_counter_range = list(range(1, 12, 1))    # 1~20
+            #ratio_denominators = [100]
+            ratio_denominators = list(range(40, 90, 10))
+            rebalance_increments = list(range(0.001, 0.01, 0.001))  # 100,110,120,130,140,150 → 6개
+            #rebalance_increments = [0.001, 0.002, 0.003, 0.004, 0.005]  # 0.1% ~ 0.5% 재조정 간격
             
             tasks = [
                 (qqq_data, sc, lc, sd, ld, ri)
