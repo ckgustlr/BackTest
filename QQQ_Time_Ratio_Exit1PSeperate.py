@@ -65,7 +65,7 @@ def fetch_qqq_data():
             raise ValueError("No data fetched. Please check the ticker or date range.")
 
 # Simulated trading function for backtesting
-def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ratio=1/320, long_size_ratio=1/320, verbose=True):
+def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ratio=1/320, long_size_ratio=1/320, verbose=True, single_mode=False):
     if verbose:
         print(f"Starting simulated trading with short_max_counter={short_max_counter}, long_max_counter={long_max_counter}, short_ratio={short_size_ratio:.2f}, long_ratio={long_size_ratio:.2f}...")
     # Calculate size ratios for short and long
@@ -276,6 +276,14 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
         long_val = sum(p['size'] * current_price * (1 + LEVERAGE * (current_price - p['price']) / p['price']) for p in long_positions) if long_positions else 0
         short_val = sum(p['size'] * current_price * (1 + LEVERAGE * (p['price'] - current_price) / p['price']) for p in short_positions) if short_positions else 0
         total_balance_here = free_balance + long_val + short_val
+
+        # 현재 보유 포지션의 exit 준비 가격 표시
+        exit_ready_list = []
+        for p in long_positions:
+            exit_ready_list.append(f"L:{p['target_price']:.2f}({p['size']:.4f})")
+        for p in short_positions:
+            exit_ready_list.append(f"S:{p['target_price']:.2f}({p['size']:.4f})")
+        current_ready_to_exit = ", ".join(exit_ready_list) if exit_ready_list else ""
         
         result = {
             'Datetime': timestamp,
@@ -301,7 +309,8 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
             'short_hour_count': short_hour_count,
             'long_hour_count': long_hour_count,
             'long_realized_pnl': round(current_long_pnl, 2),
-            'short_realized_pnl': round(current_short_pnl, 2)
+            'short_realized_pnl': round(current_short_pnl, 2),
+            'Current_readyto_Exit': current_ready_to_exit  # ← 마지막에 추가
         }
 
         # Entry conditions based on separate short and long counters
@@ -408,23 +417,6 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
             result['total_rate'] = 0
         
         # Append result rows
-        # ✓ DROP 조건: short_profit < -10 OR long_profit < -10
-        short_p = result.get('short_profit', 0)
-        long_p = result.get('long_profit', 0)
-        
-        # Append result rows
-        # ✓ DROP 조건: short_profit < -10 OR long_profit < -10 (단, -100 제외)
-        short_p = result.get('short_profit', 0)
-        long_p = result.get('long_profit', 0)
-        
-        if (short_p < -10 and short_p != -100) or (long_p < -10 and long_p != -100):
-            if verbose:
-                print(f"  ! DROPPED at {timestamp}: short_profit={short_p} < -10 OR long_profit={long_p} < -10 (excluding -100)")
-            return pd.DataFrame(), pd.DataFrame()
-        
-        result_rows.append(result.copy())
-
-        # Append result rows
         result_rows.append(result.copy())
         if result['entry_long'] or result['entry_short'] or result['exit_long'] or result['exit_short']:
             event_rows.append(result.copy())
@@ -440,14 +432,20 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
 
     if verbose:
         print("Simulated trading completed.")
-    # ✓ 드랍 조건 검사 (DataFrame 생성 前)
+    
+    # ✓ 드랍 조건 검사 (DataFrame 생성 前) - 싱글모드는 계속, 멀티모드는 중단
     if result_rows:
         last_result = result_rows[-1]
         if last_result.get('total_rate', 0) > 100:
-            if verbose:
-                print(f"  ! DROPPED: total_rate={last_result.get('total_rate')} > 100")
-            # 빈 DataFrame 반환 (또는 None)
-            return pd.DataFrame(), pd.DataFrame()
+            if single_mode:
+                # 싱글 모드: 로그만 출력하고 계속 진행
+                if verbose:
+                    print(f"  ! DROPPED (LOG ONLY): total_rate={last_result.get('total_rate')} > 100")
+            else:
+                # 멀티 모드: 즉시 중단
+                if verbose:
+                    print(f"  ! DROPPED: total_rate={last_result.get('total_rate')} > 100")
+                return pd.DataFrame(), pd.DataFrame()
     
     # Return both DataFrames: all timestamps and only events
     return pd.DataFrame(result_rows), pd.DataFrame(event_rows)
@@ -464,13 +462,18 @@ def _run_one_case(tup):
             long_max_counter=long_counter,
             short_size_ratio=short_ratio,
             long_size_ratio=long_ratio,
-            verbose=False,
+            verbose=False,  # 멀티 모드에서는 상세 출력 비활성화
+            single_mode=False
         )
+
+        # 드랍 조건: 결과가 비어있거나, total_rate가 한 번이라도 100을 초과한 경우
+        if all_results.empty:
+            return ((short_counter, long_counter, short_denom, long_denom), None)
+
         total_rate_series = pd.to_numeric(all_results["total_rate"], errors="coerce")
-        if total_rate_series is not None and not total_rate_series.empty:
-            last_total_rate = total_rate_series.iloc[-1]
-            if last_total_rate > 100:
-                return ((short_counter, long_counter, short_denom, long_denom), None)
+        if (total_rate_series > 100).any():
+            return ((short_counter, long_counter, short_denom, long_denom), None)
+
         final_balance = all_results["total_balance"].iloc[-1]
         return ((short_counter, long_counter, short_denom, long_denom), final_balance)
     except Exception:
@@ -487,21 +490,21 @@ if __name__ == "__main__":
             print("\n" + "="*80)
             print("SINGLE TEST MODE (QQQ_SINGLE_TEST=1): 1 case only — S=18, L=1, ratio 1/110 1/90")
             print("="*80)
-            best_short_counter, best_long_counter = 18, 1
-            best_short_denom, best_long_denom = 110, 90
+            best_short_counter, best_long_counter = 16, 1
+            best_short_denom, best_long_denom = 310, 100
         else:
             # 1~20 x 1~20 시간, 비율 1/50~1/110 (10단위 7개) 각각 → 20*20*7*7 = 19600 케이스, total_rate>100 드랍
             # CPU 멀티프로세싱으로 병렬 실행
             print("\n" + "="*80)
-            print("Testing: SHORT_TIME=1~20, LONG_TIME=1~20, SHORT_RATIO=1/300~1/360(7), LONG_RATIO=1/300~1/360(7)")
-            print("Total: 20*20*7*7 = 19600 cases (total_rate>100 드랍,SHORT_PROFIT<-10% 드랍, LONG_PROFIT<-10% 드랍)")
+            print("Testing: SHORT_TIME=1~20, LONG_TIME=1~20, SHORT_RATIO=1/120~1/170(6), LONG_RATIO=1/120~1/170(6)")
+            print("Total: 20*20*6*6 = 14400 cases (total_rate>100 드랍,SHORT_PROFIT<-10% 드랍, LONG_PROFIT<-10% 드랍)")
             n_workers = min(16, os.cpu_count() or 8)
             print(f"Parallel: ProcessPoolExecutor max_workers={n_workers}")
             print("="*80)
             
-            short_counter_range = list(range(1, 21))   # 1~20
-            long_counter_range = list(range(1, 21))    # 1~20
-            ratio_denominators = list(range(300, 370, 10))  # 300,310,320,330,340,350,360 → 7개
+            short_counter_range = list(range(1, 22,3))   # 1~20
+            long_counter_range = list(range(1, 22,3))    # 1~20
+            ratio_denominators = list(range(100, 320, 30))  # 120,130,140,150,160,170 → 6개
             
             tasks = [
                 (qqq_data, sc, lc, sd, ld)
@@ -516,10 +519,10 @@ if __name__ == "__main__":
             with ProcessPoolExecutor(max_workers=n_workers) as executor:
                 for key, balance in executor.map(_run_one_case, tasks):
                     done += 1
-                    if done % 500 == 0 or done == total_combos:
-                        print(f"Progress: {done}/{total_combos}", flush=True)
+                    print(f"Progress: {done}/{total_combos} cases", end='\r', flush=True)
                     if balance is not None:
                         results_matrix[key] = balance
+            print()  # Move to the next line after progress is done
             
             print("\n" + "="*80)
             print("Optimization complete. Finding best (short_time, long_time, short_ratio, long_ratio)...")
@@ -545,9 +548,20 @@ if __name__ == "__main__":
             short_max_counter=best_short_counter,
             long_max_counter=best_long_counter,
             short_size_ratio=1.0 / best_short_denom,
-            long_size_ratio=1.0 / best_long_denom
+            long_size_ratio=1.0 / best_long_denom,
+            single_mode=SINGLE_TEST_MODE  # ← 이 줄 추가!!
         )
-        
+
+        # 빈 DataFrame 체크 (드랍된 경우 - 싱글 모드에서만 계속)
+        if all_results.empty:
+            if not SINGLE_TEST_MODE:
+                print("✗ This parameter set was DROPPED")
+                sys.exit(0)
+            else:
+                print("\n✗ DROPPED (Single mode: continuing with empty results)")
+                print("="*80)
+                # 빈 데이터로도 계속 진행
+
         # Check drop condition: ANY row where total_rate > 100
         if 'total_rate' in all_results.columns:
             total_rate_col = pd.to_numeric(all_results['total_rate'], errors='coerce')
@@ -562,15 +576,18 @@ if __name__ == "__main__":
                 print(f"\n!!! DROP CONDITION MET !!!")
                 print(f"Timestamp: {exceed_timestamp}")
                 print(f"total_rate: {exceed_value:.2f} > 100")
-                print("✗ This parameter set is DROPPED (excluded from results)")
-                print("="*80)
-                sys.exit(0)
+                if not SINGLE_TEST_MODE:
+                    print("✗ This parameter set is DROPPED (excluded from results)")
+                    print("="*80)
+                    sys.exit(0)
+                else:
+                    print("! SINGLE MODE: Continuing despite drop condition for debugging/upload.")
 
         col_order = [
             'Datetime','Close','entry_short','exit_short','short_size','short_count','short_total_size','short_avg',
             'short_profit','entry_long','exit_long','long_size','long_count','long_total_size','long_avg','long_profit',
             'free_balance','long_val','short_val','total_balance','short_hour_count','long_hour_count','long_realized_pnl','short_realized_pnl',
-            'short_entry_rate','long_entry_rate','total_rate'
+            'short_entry_rate','long_entry_rate','total_rate','Current_readyto_Exit'  # ← 추가
         ]
         all_results = all_results[col_order]
         all_results = all_results.drop_duplicates(subset=['Datetime'], keep='first')
@@ -620,9 +637,12 @@ if __name__ == "__main__":
                 last_total_rate = total_rate_series.iloc[-1]
                 if last_total_rate > 100:
                     print(f"\n!!! DROP CONDITION MET: total_rate={last_total_rate:.2f} > 100 !!!")
-                    print("✗ This parameter set is DROPPED (excluded from results)")
-                    print("="*80)
-                    sys.exit(0)
+                    if not SINGLE_TEST_MODE:
+                        print("✗ This parameter set is DROPPED (excluded from results)")
+                        print("="*80)
+                        sys.exit(0)
+                    else:
+                        print("! SINGLE MODE: Continuing...")
         
         # =====================
         # 성과 지표
