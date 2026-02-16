@@ -11,8 +11,11 @@ import sys
 
 # Jetson 등에서 빠른 확인용: True면 1케이스만 실행 (S=12, L=1, ratio 1/80)
 #SINGLE_TEST_MODE = os.environ.get("QQQ_SINGLE_TEST", "").lower() in ("1", "true", "yes")
-SINGLE_TEST_MODE = False
+SINGLE_TEST_MODE = True
 
+# Short Strategy Toggle: Set to False to test LONG-only strategy separately
+# Change this to False to validate long-only performance without short positions
+ENABLE_SHORT = False  # Change to False for LONG-only testing
 
 # Hyperparameters
 LEVERAGE = 10
@@ -65,9 +68,10 @@ def fetch_qqq_data():
             raise ValueError("No data fetched. Please check the ticker or date range.")
 
 # Simulated trading function for backtesting
-def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ratio=1/320, long_size_ratio=1/320, rebalance_increment=0.001, verbose=True, single_mode=False):
+def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ratio=1/320, long_size_ratio=1/320, rebalance_increment=0.001, enable_short=True, verbose=True, single_mode=False):
     if verbose:
-        print(f"Starting simulated trading with short_max_counter={short_max_counter}, long_max_counter={long_max_counter}, short_ratio={short_size_ratio:.2f}, long_ratio={long_size_ratio:.2f}...")
+        mode_str = "LONG only" if not enable_short else "SHORT + LONG"
+        print(f"Starting simulated trading ({mode_str}) with short_max_counter={short_max_counter}, long_max_counter={long_max_counter}, short_ratio={short_size_ratio:.2f}, long_ratio={long_size_ratio:.2f}...")
     # Calculate size ratios for short and long
     # 이전 계산: SHORT_SIZE_RATIO = short_max_counter / 120
     #           LONG_SIZE_RATIO = long_max_counter / 120
@@ -78,6 +82,9 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
     # 롱+숏 = 320번 총 진입
     SHORT_SIZE_RATIO = short_size_ratio
     LONG_SIZE_RATIO = long_size_ratio
+
+    if verbose:
+        print(f"  SHORT_SIZE_RATIO={SHORT_SIZE_RATIO:.4f}, LONG_SIZE_RATIO={LONG_SIZE_RATIO:.4f}")
 
     # Initialize variables
     free_balance = 5000  # Example starting balance
@@ -142,19 +149,35 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
             long_val_0 = sum(p['size'] * current_price * (1 + LEVERAGE * (current_price - p['price']) / p['price']) for p in long_positions) if long_positions else 0
             short_val_0 = sum(p['size'] * current_price * (1 + LEVERAGE * (p['price'] - current_price) / p['price']) for p in short_positions) if short_positions else 0
             current_total_balance = free_balance + long_val_0 + short_val_0
-            long_entry_size = (current_total_balance * LONG_SIZE_RATIO) / current_price
-            short_entry_size = (current_total_balance * SHORT_SIZE_RATIO) / current_price
-            free_balance -= (long_entry_size * current_price + short_entry_size * current_price)
-            long_positions.append({'price': current_price, 'size': long_entry_size, 'unit': 1.0, 'profit_target': None, 'target_price': round(current_price * 1.01, 2), 'active': True, 'entry_time': timestamp})
-            short_positions.append({'price': current_price, 'size': short_entry_size, 'unit': 1.0, 'profit_target': None, 'target_price': round(current_price * 0.99, 2), 'active': True, 'entry_time': timestamp})
+            
+            # enable_short가 False면 전체 금액을 long에만 사용
+            if enable_short:
+                long_entry_size = (current_total_balance * LONG_SIZE_RATIO) / current_price
+                short_entry_size = (current_total_balance * SHORT_SIZE_RATIO) / current_price
+                free_balance -= (long_entry_size * current_price + short_entry_size * current_price)
+                long_positions.append({'price': current_price, 'size': long_entry_size, 'unit': 1.0, 'profit_target': None, 'target_price': round(current_price * 1.01, 2), 'active': True, 'entry_time': timestamp})
+                short_positions.append({'price': current_price, 'size': short_entry_size, 'unit': 1.0, 'profit_target': None, 'target_price': round(current_price * 0.99, 2), 'active': True, 'entry_time': timestamp})
+                short_amount_cum = short_entry_size * current_price
+                last_entry_price_short = current_price
+                short_hour_count = 1
+                if verbose:
+                    print(f"  [INIT] Long Entry: size={long_entry_size:.4f}, price={current_price}, capital={long_entry_size*current_price:.2f}")
+                    print(f"  [INIT] Short Entry: size={short_entry_size:.4f}, price={current_price}, capital={short_entry_size*current_price:.2f}")
+            else:
+                # Short을 disable하는 경우 long비율만 사용
+                long_entry_size = (current_total_balance * LONG_SIZE_RATIO) / current_price
+                short_entry_size = 0  # No short position when disabled
+                free_balance -= (long_entry_size * current_price)
+                long_positions.append({'price': current_price, 'size': long_entry_size, 'unit': 1.0, 'profit_target': None, 'target_price': round(current_price * 1.01, 2), 'active': True, 'entry_time': timestamp})
+                short_amount_cum = 0
+                if verbose:
+                    print(f"  [INIT LONG-ONLY] Long Entry: size={long_entry_size:.4f}, price={current_price}, capital={long_entry_size*current_price:.2f}")
+            
             # Update cumulative amounts for first entry
             long_amount_cum = long_entry_size * current_price
-            short_amount_cum = short_entry_size * current_price
             last_entry_price_long = current_price
-            last_entry_price_short = current_price
             first_entry_done = True
             # Set counters to 1 for the initial entry
-            short_hour_count = 1
             long_hour_count = 1
             # Calculate totals and total balance after initial entries (포지션 평가 = 청산 시 받을 금액, 레버리지 반영)
             short_total_size = sum(p['size'] for p in short_positions) if short_positions else 0
@@ -168,10 +191,10 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
                 'Close': round(float(row['Close']), 2),
                 'short_avg': round(short_avg, 2),
                 'short_profit': short_profit,
-                'entry_short': round(current_price, 2),
+                'entry_short': round(current_price, 2) if enable_short else '',
                 'exit_short': '',
                 'short_size': round(short_entry_size, 2),
-                'short_count': round(1.0, 2),
+                'short_count': round(1.0, 2) if enable_short else 0,
                 'short_total_size': round(short_total_size, 2),
                 'entry_long': round(current_price, 2),
                 'exit_long': '',
@@ -184,27 +207,30 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
                 'long_val': round(long_val, 2),
                 'short_val': round(short_val, 2),
                 'total_balance': round(total_balance, 2),
-                'short_hour_count': short_hour_count,
+                'short_hour_count': short_hour_count if enable_short else 0,
                 'long_hour_count': long_hour_count,
                 'long_realized_pnl': round(0, 2),
                 'short_realized_pnl': round(0, 2)
             }
             # Initialize cumulative principal amounts with the first entries
-            short_amount_cum = result['entry_short'] * result['short_size']
+            short_amount_cum = result['entry_short'] * result['short_size'] if enable_short else 0
             long_amount_cum = result['entry_long'] * result['long_size']
 
             # Calculate rate columns for initial entry based on cumulative principal
             half_balance = total_balance / 2 if total_balance != 0 else 0
 
             if half_balance > 0:
-                result['short_entry_rate'] = round(short_amount_cum / half_balance * 100, 2)
+                result['short_entry_rate'] = round(short_amount_cum / half_balance * 100, 2) if enable_short else 0
                 result['long_entry_rate'] = round(long_amount_cum / half_balance * 100, 2)
             else:
                 result['short_entry_rate'] = 0
                 result['long_entry_rate'] = 0
 
             if total_balance > 0:
-                result['total_rate'] = round((short_amount_cum + long_amount_cum) / total_balance * 100, 2)
+                if enable_short:
+                    result['total_rate'] = round((short_amount_cum + long_amount_cum) / total_balance * 100, 2)
+                else:
+                    result['total_rate'] = round(long_amount_cum / total_balance * 100, 2)
             else:
                 result['total_rate'] = 0
 
@@ -239,20 +265,21 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
 
         # 2. 분할 매도 조건 (각 투입 건별 1% 수익 시)
         exit_short_parts = []
-        for p in short_positions:
-            if p.get('active', True) and current_price <= p['target_price']:
-                received = p['size'] * current_price * (1 + LEVERAGE * (p['price'] - current_price) / p['price'])
-                # 평단 기준 손익 계산 (트리거된 target_price 기준으로, exit 시점의 평단 사용)
-                actual_profit = p['size'] * (short_avg_price_at_exit - p['target_price']) * LEVERAGE
-                free_balance += received
-                current_short_pnl += actual_profit
-                short_realized_pnl += actual_profit
-                short_amount_cum = max(0, short_amount_cum - p['size'] * p['price'])
-                exit_short_parts.append(f"{p['price']:.2f}->{current_price:.2f}({p['size']:.4f})")
-                p['active'] = False  # Mark as closed, don't remove from list
-                # print(f"분할 매도(숏) 실현: {current_price} (진입가: {p['price']}, size: {p['size']})")
-        if exit_short_parts:
-            short_exit_occurred = True
+        if enable_short:  # Only process short exits when enabled
+            for p in short_positions:
+                if p.get('active', True) and current_price <= p['target_price']:
+                    received = p['size'] * current_price * (1 + LEVERAGE * (p['price'] - current_price) / p['price'])
+                    # 평단 기준 손익 계산 (트리거된 target_price 기준으로, exit 시점의 평단 사용)
+                    actual_profit = p['size'] * (short_avg_price_at_exit - p['target_price']) * LEVERAGE
+                    free_balance += received
+                    current_short_pnl += actual_profit
+                    short_realized_pnl += actual_profit
+                    short_amount_cum = max(0, short_amount_cum - p['size'] * p['price'])
+                    exit_short_parts.append(f"{p['price']:.2f}->{current_price:.2f}({p['size']:.4f})")
+                    p['active'] = False  # Mark as closed, don't remove from list
+                    # print(f"분할 매도(숏) 실현: {current_price} (진입가: {p['price']}, size: {p['size']})")
+            if exit_short_parts:
+                short_exit_occurred = True
 
         exit_long_parts = []
         for p in long_positions:
@@ -292,39 +319,53 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
                 # Sort positions by their original entry price to apply new targets systematically
                 active_long_positions.sort(key=lambda p: p['price'])
                 
-                # Determine the starting profit percentage for the new targets
-                # It starts from the next 0.1% increment above the current profit, with a minimum of 1%
-                start_profit_pct = max(0.01, np.floor(current_profit_percent * 1000) / 1000 + rebalance_increment)
+                # Rebalance strategy: Set target prices based on current profit + incremental steps
+                # If current profit is 1.5%, then:
+                # 1st position: 1.5% + 0.1% = 1.6%
+                # 2nd position: 1.5% + 0.6% = 2.1% (1.5% + 0.1% * 6)
+                # 3rd position: 1.5% + 1.1% = 2.6% (1.5% + 0.1% * 11)
+                # Pattern: current_profit_percent + rebalance_increment * (1 + 5*i)
+
+                if verbose:
+                    print(f"  [REBALANCE LONG] time={timestamp}, current_price={current_price:.2f}, long_avg={long_avg_price_before:.2f}, current_profit%={current_profit_percent*100:.2f}%, count={len(active_long_positions)}")
 
                 # Assign new target prices to remaining long positions
                 for i, p in enumerate(active_long_positions):
-                    new_target_profit_pct = start_profit_pct + i * rebalance_increment  # 재조정 간격
+                    new_target_profit_pct = current_profit_percent + rebalance_increment * (1 + 5 * i)
                     p['target_price'] = long_avg_price_before * (1 + new_target_profit_pct)
+                    if verbose:
+                        print(f"    [{i}] target_profit%={new_target_profit_pct*100:.2f}%, target_price={p['target_price']:.2f}")
                 
                 last_rebalance_time_long = timestamp
 
         # --- Short Position Rebalancing ---
         # 1시간 이상 전에 진입한 활성 포지션만 재조정 대상
-        active_short_positions = [p for p in short_positions if p.get('active', True) and (p.get('entry_time') is None or (timestamp - p.get('entry_time', timestamp)) >= datetime.timedelta(hours=1))]
-        if active_short_positions:
-            # Check if 1 hour has passed since the last rebalance
-            if last_rebalance_time_short is None or (timestamp - last_rebalance_time_short) >= datetime.timedelta(hours=1):
-                # Rebalance target 계산용 (평단 손상 방지)
-                short_rebalance_avg = sum(p['price'] * p['size'] for p in active_short_positions) / sum(p['size'] for p in active_short_positions)
-                current_profit_percent = (short_rebalance_avg - current_price) / short_rebalance_avg
+        if enable_short:  # Only rebalance shorts when enabled
+            active_short_positions = [p for p in short_positions if p.get('active', True) and (p.get('entry_time') is None or (timestamp - p.get('entry_time', timestamp)) >= datetime.timedelta(hours=1))]
+            if active_short_positions:
+                # Check if 1 hour has passed since the last rebalance
+                if last_rebalance_time_short is None or (timestamp - last_rebalance_time_short) >= datetime.timedelta(hours=1):
+                    # Rebalance target 계산용 (평단 손상 방지)
+                    short_rebalance_avg = sum(p['price'] * p['size'] for p in active_short_positions) / sum(p['size'] for p in active_short_positions)
+                    current_profit_percent = (short_rebalance_avg - current_price) / short_rebalance_avg
 
-                # Sort positions by their original entry price
-                active_short_positions.sort(key=lambda p: p['price'], reverse=True) # Higher price first
-                
-                # Determine the starting profit percentage for the new targets
-                start_profit_pct = max(0.01, np.floor(current_profit_percent * 1000) / 1000 + rebalance_increment)
+                    # Sort positions by their original entry price
+                    active_short_positions.sort(key=lambda p: p['price'], reverse=True) # Higher price first
+                    
+                    # Rebalance strategy: Set target prices based on current profit + incremental steps
+                    # Pattern: current_profit_percent - rebalance_increment * (1 + 5*i) (inverted for short)
 
-                # Assign new target prices to remaining short positions
-                for i, p in enumerate(active_short_positions):
-                    new_target_profit_pct = start_profit_pct + i * rebalance_increment  # 재조정 간격
-                    p['target_price'] = short_rebalance_avg * (1 - new_target_profit_pct)
+                    if verbose:
+                        print(f"  [REBALANCE SHORT] time={timestamp}, current_price={current_price:.2f}, short_avg={short_rebalance_avg:.2f}, current_profit%={current_profit_percent*100:.2f}%, count={len(active_short_positions)}")
 
-                last_rebalance_time_short = timestamp
+                    # Assign new target prices to remaining short positions
+                    for i, p in enumerate(active_short_positions):
+                        new_target_profit_pct = current_profit_percent + rebalance_increment * (1 + 5 * i)
+                        p['target_price'] = short_rebalance_avg * (1 - new_target_profit_pct)
+                        if verbose:
+                            print(f"    [{i}] target_profit%={new_target_profit_pct*100:.2f}%, target_price={p['target_price']:.2f}")
+
+                    last_rebalance_time_short = timestamp
                     
         # Create result dictionary AFTER exit logic
         # Exit 후에는 평단을 재계산하지 않음 - entry 시에만 변경
@@ -397,7 +438,7 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
         long_avg_for_entry = sum(p['price'] * p['size'] for p in active_long_calc) / sum(p['size'] for p in active_long_calc) if active_long_calc else 0
 
         # Short entry logic when short_hour_count == short_max_counter
-        if short_hour_count == short_max_counter:
+        if enable_short and short_hour_count == short_max_counter:  # Only when short is enabled
             if current_price > short_avg_for_entry:
                 entry_size = short_entry_base  # Full size (수량)
                 free_balance -= entry_size * current_price
@@ -512,14 +553,18 @@ def simulated_trade(data, short_max_counter=3, long_max_counter=3, short_size_ra
         #     print(f"[ENTRY DEBUG] {timestamp} | Entry Short at {result['entry_short']} | Size: {result['short_size']:.4f} | short_amount_cum: {short_amount_cum:.2f}")
 
         if half_balance > 0:
-            result['short_entry_rate'] = round(short_amount / half_balance * 100, 2)
+            result['short_entry_rate'] = round(short_amount / half_balance * 100, 2) if enable_short else 0
             result['long_entry_rate'] = round(long_amount / half_balance * 100, 2)
         else:
             result['short_entry_rate'] = 0
             result['long_entry_rate'] = 0
 
         if total_balance > 0:
-            result['total_rate'] = round((short_amount + long_amount) / total_balance * 100, 2)
+            # When short is disabled, calculate total_rate using only long_amount
+            if enable_short:
+                result['total_rate'] = round((short_amount + long_amount) / total_balance * 100, 2)
+            else:
+                result['total_rate'] = round(long_amount / total_balance * 100, 2)
         else:
             result['total_rate'] = 0
         
@@ -570,6 +615,7 @@ def _run_one_case(tup):
             short_size_ratio=short_ratio,
             long_size_ratio=long_ratio,
             rebalance_increment=rebalance_increment,
+            enable_short=ENABLE_SHORT,  # Use the global ENABLE_SHORT setting
             verbose=False,  # 멀티 모드에서는 상세 출력 비활성화
             single_mode=False
         )
@@ -596,10 +642,11 @@ if __name__ == "__main__":
         if SINGLE_TEST_MODE:
             # Jetson 등: 단일 케이스만 실행 (빠른 확인용). 환경변수 QQQ_SINGLE_TEST=1 로 활성화
             print("\n" + "="*80)
-            print("SINGLE TEST MODE (QQQ_SINGLE_TEST=1): 1 case only — S=18, L=1, ratio 1/110 1/90")
+            print("SINGLE TEST MODE (QQQ_SINGLE_TEST=1): 1 case only — S=12, L=12, ratio 1/100 1/100")
             print("="*80)
             best_short_counter, best_long_counter = 12, 12
-            best_short_denom, best_long_denom = 120, 120
+            best_short_denom, best_long_denom = 100, 100
+            best_rebalance_increment = 0.001 
         else:
             # 1~20 x 1~20 시간, 비율 1/50~1/110 (10단위 7개) 각각 → 20*20*7*7 = 19600 케이스, total_rate>100 드랍
             # CPU 멀티프로세싱으로 병렬 실행
@@ -664,6 +711,7 @@ if __name__ == "__main__":
             short_size_ratio=1.0 / best_short_denom,
             long_size_ratio=1.0 / best_long_denom,
             rebalance_increment=final_rebalance_increment,
+            enable_short=ENABLE_SHORT,  # Use the global ENABLE_SHORT setting
             single_mode=SINGLE_TEST_MODE  # ← 이 줄 추가!!
         )
 
@@ -698,12 +746,21 @@ if __name__ == "__main__":
                 else:
                     print("! SINGLE MODE: Continuing despite drop condition for debugging/upload.")
 
-        col_order = [
-            'Datetime','Close','entry_short','exit_short','short_size','short_count','short_total_size','short_avg',
-            'short_profit','entry_long','exit_long','long_size','long_count','long_total_size','long_avg','long_profit',
-            'free_balance','long_val','short_val','total_balance','short_hour_count','long_hour_count','long_realized_pnl','short_realized_pnl',
-            'short_entry_rate','long_entry_rate','total_rate','Current_readyto_Exit'  # ← 추가
-        ]
+        # Conditionally filter out short-related columns when ENABLE_SHORT=False
+        if ENABLE_SHORT:
+            col_order = [
+                'Datetime','Close','entry_short','exit_short','short_size','short_count','short_total_size','short_avg',
+                'short_profit','entry_long','exit_long','long_size','long_count','long_total_size','long_avg','long_profit',
+                'free_balance','long_val','short_val','total_balance','short_hour_count','long_hour_count','long_realized_pnl','short_realized_pnl',
+                'short_entry_rate','long_entry_rate','total_rate','Current_readyto_Exit'  # ← 추가
+            ]
+        else:
+            # When short is disabled, exclude short-related columns
+            col_order = [
+                'Datetime','Close','entry_long','exit_long','long_size','long_count','long_total_size','long_avg','long_profit',
+                'free_balance','long_val','total_balance','long_hour_count','long_realized_pnl',
+                'long_entry_rate','total_rate','Current_readyto_Exit'
+            ]
         all_results = all_results[col_order]
         all_results = all_results.drop_duplicates(subset=['Datetime'], keep='first')
         event_results = event_results[col_order]
